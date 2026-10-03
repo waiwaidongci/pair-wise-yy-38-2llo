@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, ensure_role, normalize_severity,
+                     require_number, require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
+from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, OBSERVATION_ROLES,
+                    RECORD_ROLES, VIEW_ROLES, completion_blockers,
+                    escalation_required, priority_score,
+                    response_deadline_hours, role_for_transition,
                     validate_transition)
 
 
@@ -17,9 +19,43 @@ class Service:
     def _view(self, role: str) -> None:
         ensure_role(role, VIEW_ROLES)
 
-    def create_item(self, payload: Dict[str, Any], actor: str, role: str) -> Dict[str, Any]:
+    def _basis(self, actor: str) -> int:
+        """返回当前水情观测依据版本；尚无观测时自动初始化默认观测。"""
+        obs = self.repository.current_observation()
+        if obs is None:
+            obs = self.repository.ensure_default_observation(actor)
+        return int(obs["version"])
+
+    def _replayed(self, request_no: Optional[str], action: str) -> Optional[Dict[str, Any]]:
+        return self.repository.get_idempotency_response(request_no, action)
+
+    # ------------------------------------------------------- observations
+    def record_observation(self, payload: Dict[str, Any], actor: str,
+                           role: str) -> Dict[str, Any]:
+        ensure_role(role, OBSERVATION_ROLES)
+        actor = require_text(actor, "actor", 100)
+        reservoir_level = require_number(payload.get("reservoir_level"), "reservoir_level")
+        inflow = require_number(payload.get("inflow"), "inflow")
+        note = payload.get("note")
+        if note is not None:
+            note = require_text(note, "note", 500)
+        obs, affected = self.repository.create_observation(
+            reservoir_level, inflow, note, actor)
+        return {"observation": obs, "affected_items": affected}
+
+    def list_observations(self, role: str) -> list:
+        self._view(role)
+        return self.repository.list_observations()
+
+    # -------------------------------------------------------------- items
+    def create_item(self, payload: Dict[str, Any], actor: str, role: str,
+                    request_no: Optional[str] = None) -> Dict[str, Any]:
         ensure_role(role, CREATE_ROLES)
         actor = require_text(actor, "actor", 100)
+        request_no = self._normalize_request_no(request_no)
+        replayed = self._replayed(request_no, "create_item")
+        if replayed is not None:
+            return self.enrich(replayed)
         title = require_text(payload.get("title"), "title", 200)
         description = require_text(payload.get("description"), "description")
         severity = normalize_severity(payload.get("severity"))
@@ -28,18 +64,20 @@ class Service:
         external_ref = payload.get("external_ref")
         if external_ref is not None:
             external_ref = require_text(external_ref, "external_ref", 100)
-        item = self.repository.create_item(title, description, severity, quantity,
-                                           threshold, external_ref, actor)
-        self.repository.append_audit("create", ENTITY, item["id"], actor, {
-            "title": title, "severity": severity, "quantity": quantity,
-            "priority": priority_score(severity, quantity, threshold),
-        })
+        basis = self._basis(actor)
+        item, _replayed = self.repository.create_item(
+            title, description, severity, quantity, threshold,
+            external_ref, basis, request_no, actor)
         return self.enrich(item)
 
     def add_record(self, item_id: int, payload: Dict[str, Any], actor: str,
-                   role: str) -> Dict[str, Any]:
+                   role: str, request_no: Optional[str] = None) -> Dict[str, Any]:
         ensure_role(role, RECORD_ROLES)
         actor = require_text(actor, "actor", 100)
+        request_no = self._normalize_request_no(request_no)
+        replayed = self._replayed(request_no, "add_record")
+        if replayed is not None:
+            return replayed
         kind = require_text(payload.get("kind"), "kind", 100)
         detail = require_text(payload.get("detail"), "detail")
         status = payload.get("status", "open")
@@ -48,16 +86,19 @@ class Service:
         external_ref = payload.get("external_ref")
         if external_ref is not None:
             external_ref = require_text(external_ref, "external_ref", 100)
-        record = self.repository.add_record(item_id, kind, detail, status,
-                                            external_ref, actor)
-        self.repository.append_audit("record", ENTITY, item_id, actor, {
-            "record_id": record["id"], "kind": kind, "status": status,
-        })
+        basis = self._basis(actor)
+        record, _replayed = self.repository.add_record(
+            item_id, kind, detail, status, external_ref, basis, request_no, actor)
         return record
 
     def transition(self, item_id: int, target: str, expected_version: int,
-                   actor: str, role: str) -> Dict[str, Any]:
+                   actor: str, role: str,
+                   request_no: Optional[str] = None) -> Dict[str, Any]:
         actor = require_text(actor, "actor", 100)
+        request_no = self._normalize_request_no(request_no)
+        replayed = self._replayed(request_no, "transition")
+        if replayed is not None:
+            return self.enrich(replayed)
         item = self.repository.get_item(item_id)
         validate_transition(item["status"], target)
         ensure_role(role, role_for_transition(target))
@@ -65,14 +106,18 @@ class Service:
             raise ValueError("expected_version必须是正整数")
         blockers = completion_blockers(target, self.repository.open_record_count(item_id))
         if blockers:
-            from .domain import ConflictError
             raise ConflictError("；".join(blockers))
-        updated = self.repository.transition_item(item_id, target, expected_version, actor)
-        self.repository.append_audit("transition", ENTITY, item_id, actor, {
-            "from": item["status"], "to": target,
-            "escalation_required": escalation_required(
-                item["severity"], item["quantity"], item["threshold"]),
-        })
+        basis = self._basis(actor)
+        updated, _replayed = self.repository.transition_item(
+            item_id, target, expected_version, actor, basis, request_no)
+        return self.enrich(updated)
+
+    def supplement_basis(self, item_id: int, actor: str, role: str) -> Dict[str, Any]:
+        """历史缺依据指令补齐水情依据并复核。"""
+        ensure_role(role, CREATE_ROLES)
+        actor = require_text(actor, "actor", 100)
+        basis = self._basis(actor)
+        updated = self.repository.supplement_basis(item_id, basis, actor)
         return self.enrich(updated)
 
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:
@@ -90,6 +135,12 @@ class Service:
     def audit(self, role: str, item_id: Optional[int] = None) -> list:
         ensure_role(role, AUDIT_ROLES)
         return self.repository.list_audit(item_id)
+
+    @staticmethod
+    def _normalize_request_no(request_no: Optional[str]) -> Optional[str]:
+        if request_no is None:
+            return None
+        return require_text(request_no, "request_no", 100)
 
     @staticmethod
     def enrich(item: Dict[str, Any]) -> Dict[str, Any]:
