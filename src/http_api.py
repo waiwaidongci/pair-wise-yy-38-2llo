@@ -42,6 +42,9 @@ def make_handler(service: Service, static_dir: str):
         def _identity(self) -> Tuple[str, str]:
             return self.headers.get("X-Actor", ""), self.headers.get("X-Role", "")
 
+        def _request_id(self, body: Dict[str, Any]) -> Optional[str]:
+            return body.get("request_id") or self.headers.get("X-Request-Id")
+
         def _body(self) -> Dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0") or 0)
             if length <= 0:
@@ -84,6 +87,10 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"items": service.list_items(role)})
+                elif path == "/api/observations":
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"observations": service.list_observations(role)})
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     actor, role = self._identity()
@@ -108,17 +115,31 @@ def make_handler(service: Service, static_dir: str):
                 path = urlparse(self.path).path
                 actor, role = self._identity()
                 body = self._body()
-                if path == "/api/items":
+                if path == "/api/observations":
+                    body.setdefault("request_id", self._request_id(body))
+                    self._json(201, service.submit_observation(body, actor, role))
+                elif path == "/api/items":
+                    body.setdefault("request_id", self._request_id(body))
                     self._json(201, service.create_item(body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
+                    body.setdefault("request_id", self._request_id(body))
                     self._json(201, service.add_record(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/recheck"):
+                    item_id = int(path.split("/")[3])
+                    body.setdefault("request_id", self._request_id(body))
+                    self._json(200, service.recheck(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/supplement-basis"):
+                    item_id = int(path.split("/")[3])
+                    body.setdefault("request_id", self._request_id(body))
+                    self._json(200, service.supplement_basis(item_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/transition"):
                     item_id = int(path.split("/")[3])
                     target = body.get("target")
                     expected = body.get("expected_version")
+                    request_id = self._request_id(body)
                     self._json(200, service.transition(
-                        item_id, target, expected, actor, role))
+                        item_id, target, expected, actor, role, request_id))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
